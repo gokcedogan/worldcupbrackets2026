@@ -1,7 +1,9 @@
 import json
-from pathlib import Path
+from datetime import datetime
 
+import gspread
 import streamlit as st
+from google.oauth2.service_account import Credentials
 
 st.set_page_config(
     page_title="2026 World Cup Bracket",
@@ -14,9 +16,6 @@ st.title("⚽ 2026 World Cup Bracket App")
 # -----------------------------
 # Basic setup
 # -----------------------------
-
-SAVE_DIR = Path("saved_brackets")
-SAVE_DIR.mkdir(exist_ok=True)
 
 users = ["Gokce", "Jack"]
 
@@ -57,7 +56,6 @@ group_letters = {
     "Group L": "L",
 }
 
-# FIFA Round of 32 fixed slots
 round32_template = [
     ("M73", "2A", "2B"),
     ("M74", "1E", "3A/B/C/D/F"),
@@ -106,22 +104,72 @@ final_template = [
 
 
 # -----------------------------
-# Helper functions
+# Google Sheets functions
 # -----------------------------
 
+@st.cache_resource
+def get_google_sheet():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    credentials = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=scopes,
+    )
+
+    client = gspread.authorize(credentials)
+    spreadsheet_name = st.secrets["gcp_service_account"]["spreadsheet_name"]
+
+    sheet = client.open(spreadsheet_name).sheet1
+    return sheet
+
+
 def save_bracket(username, data):
-    file_path = SAVE_DIR / f"{username.lower()}_bracket.json"
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+    sheet = get_google_sheet()
+
+    all_records = sheet.get_all_records()
+    row_to_update = None
+
+    for index, record in enumerate(all_records, start=2):
+        if record.get("user") == username:
+            row_to_update = index
+            break
+
+    bracket_json = json.dumps(data, ensure_ascii=False)
+    last_saved = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    row_values = [username, bracket_json, last_saved]
+
+    if row_to_update:
+        sheet.update(f"A{row_to_update}:C{row_to_update}", [row_values])
+    else:
+        sheet.append_row(row_values)
 
 
 def load_bracket(username):
-    file_path = SAVE_DIR / f"{username.lower()}_bracket.json"
-    if file_path.exists():
-        with open(file_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    try:
+        sheet = get_google_sheet()
+        all_records = sheet.get_all_records()
 
+        for record in all_records:
+            if record.get("user") == username:
+                bracket_json = record.get("bracket_json", "")
+
+                if bracket_json:
+                    return json.loads(bracket_json)
+
+        return {}
+
+    except Exception as e:
+        st.error(f"Could not load bracket from Google Sheets: {e}")
+        return {}
+
+
+# -----------------------------
+# Helper functions
+# -----------------------------
 
 def get_saved_group_pick(saved_data, group_name, position):
     try:
@@ -138,12 +186,6 @@ def get_saved_value(saved_data, section, key, default=""):
 
 
 def group_result_lookup(group_picks):
-    """
-    Creates labels like:
-    1A = winner of Group A
-    2A = runner-up of Group A
-    3A = third-place team of Group A
-    """
     lookup = {}
 
     for group_name, picks in group_picks.items():
@@ -158,10 +200,6 @@ def group_result_lookup(group_picks):
 
 
 def resolve_slot(slot, lookup, third_place_assignments=None):
-    """
-    Turns a bracket slot like 1A or 2B into the selected team name.
-    For third-place slots like 3A/B/C/D/F, use the manually assigned third-place team.
-    """
     if third_place_assignments is None:
         third_place_assignments = {}
 
@@ -203,6 +241,18 @@ def pick_winner(match_id, team1, team2, saved_data, section):
     return winner
 
 
+def bracket_table(section_data):
+    rows = []
+
+    for match_id, winner in section_data.items():
+        rows.append({
+            "Match": match_id,
+            "Winner": winner
+        })
+
+    return rows
+
+
 saved_data = load_bracket(user)
 
 # -----------------------------
@@ -227,7 +277,6 @@ with tab_group:
         st.subheader(group_name)
 
         group_picks[group_name] = {}
-
         available_teams = teams.copy()
 
         for position in ["1st", "2nd", "3rd", "4th"]:
@@ -264,11 +313,16 @@ with tab_group:
         "quarterfinals": saved_data.get("quarterfinals", {}),
         "semifinals": saved_data.get("semifinals", {}),
         "final": saved_data.get("final", {}),
+        "champion": saved_data.get("champion", ""),
     }
 
     if st.button("💾 Save Group Stage"):
-        save_bracket(user, bracket_data)
-        st.success(f"{user}'s group-stage picks have been saved!")
+        try:
+            save_bracket(user, bracket_data)
+            st.success(f"{user}'s group-stage picks have been saved to Google Sheets!")
+        except Exception as e:
+            st.error(f"Could not save to Google Sheets: {e}")
+
 
 # -----------------------------
 # Knockout stage tab
@@ -277,11 +331,22 @@ with tab_group:
 with tab_knockout:
     st.header("Knockout Stage")
 
-    if not saved_data.get("group_stage"):
-        st.warning("Please save your group-stage picks first.")
+    current_group_picks = group_picks
+
+    missing_picks = []
+
+    for group_name, picks in current_group_picks.items():
+        for position in ["1st", "2nd", "3rd", "4th"]:
+            if not picks.get(position):
+                missing_picks.append(f"{group_name} - {position}")
+
+    if missing_picks:
+        st.warning("Please complete all group-stage rankings before moving to the knockout stage.")
+        with st.expander("Missing picks"):
+            for item in missing_picks:
+                st.write(item)
     else:
-        saved_group_picks = saved_data["group_stage"]
-        lookup = group_result_lookup(saved_group_picks)
+        lookup = group_result_lookup(current_group_picks)
 
         st.subheader("Step 1: Choose the 8 third-place teams that advance")
 
@@ -295,6 +360,11 @@ with tab_knockout:
                 third_place_options.append(f"3{letter}: {third_team}")
 
         saved_third_qualifiers = saved_data.get("third_place_qualifiers", [])
+
+        saved_third_qualifiers = [
+            item for item in saved_third_qualifiers
+            if item in third_place_options
+        ]
 
         third_place_qualifiers = st.multiselect(
             "Pick exactly 8 third-place teams",
@@ -316,11 +386,11 @@ with tab_knockout:
             team_name = item.split(": ", 1)[1]
             third_place_team_by_group[group_code] = team_name
 
-        st.subheader("Step 2: Assign third-place teams to FIFA-eligible Round of 32 slots")
+        st.subheader("Step 2: Assign third-place teams to eligible Round of 32 slots")
 
         st.caption(
             "Some Round of 32 slots can only receive third-place teams from certain groups. "
-            "For example, one slot is 3A/B/C/D/F, meaning a qualified third-place team from one of those groups."
+            "For example, 3A/B/C/D/F means a qualified third-place team from one of those groups."
         )
 
         third_place_assignments = {}
@@ -346,11 +416,10 @@ with tab_knockout:
                 default=""
             )
 
+            if saved_assignment not in eligible_teams:
+                saved_assignment = ""
+
             options = [""] + eligible_teams
-
-            if saved_assignment and saved_assignment not in options:
-                options.append(saved_assignment)
-
             default_index = options.index(saved_assignment) if saved_assignment in options else 0
 
             third_place_assignments[slot] = st.selectbox(
@@ -464,7 +533,7 @@ with tab_knockout:
 
         full_bracket_data = {
             "user": user,
-            "group_stage": saved_group_picks,
+            "group_stage": current_group_picks,
             "third_place_qualifiers": third_place_qualifiers,
             "third_place_assignments": third_place_assignments,
             "round32": round32_winners,
@@ -476,8 +545,12 @@ with tab_knockout:
         }
 
         if st.button("💾 Save Full Bracket"):
-            save_bracket(user, full_bracket_data)
-            st.success(f"{user}'s full bracket has been saved!")
+            try:
+                save_bracket(user, full_bracket_data)
+                st.success(f"{user}'s full bracket has been saved to Google Sheets!")
+            except Exception as e:
+                st.error(f"Could not save to Google Sheets: {e}")
+
 
 # -----------------------------
 # View / compare tab
@@ -494,10 +567,77 @@ with tab_compare:
 
     view_data = load_bracket(selected_view_user)
 
-    if view_data:
-        st.json(view_data)
-    else:
+    if not view_data:
         st.info(f"No saved bracket yet for {selected_view_user}.")
+    else:
+        st.subheader(f"{selected_view_user}'s Group Stage Picks")
+
+        group_rows = []
+
+        for group_name, picks in view_data.get("group_stage", {}).items():
+            group_rows.append({
+                "Group": group_name,
+                "1st": picks.get("1st", ""),
+                "2nd": picks.get("2nd", ""),
+                "3rd": picks.get("3rd", ""),
+                "4th": picks.get("4th", "")
+            })
+
+        if group_rows:
+            st.dataframe(group_rows, use_container_width=True, hide_index=True)
+
+        st.subheader("Third-Place Qualifiers")
+
+        third_rows = []
+
+        for item in view_data.get("third_place_qualifiers", []):
+            third_rows.append({
+                "Qualified third-place team": item
+            })
+
+        if third_rows:
+            st.dataframe(third_rows, use_container_width=True, hide_index=True)
+        else:
+            st.info("No third-place qualifiers saved yet.")
+
+        st.subheader("Third-Place Slot Assignments")
+
+        assignment_rows = []
+
+        for slot, team in view_data.get("third_place_assignments", {}).items():
+            assignment_rows.append({
+                "Slot": slot,
+                "Team": team
+            })
+
+        if assignment_rows:
+            st.dataframe(assignment_rows, use_container_width=True, hide_index=True)
+
+        st.subheader("Knockout Stage Picks")
+
+        knockout_sections = {
+            "Round of 32": "round32",
+            "Round of 16": "round16",
+            "Quarterfinals": "quarterfinals",
+            "Semifinals": "semifinals",
+            "Final": "final"
+        }
+
+        for display_name, section_key in knockout_sections.items():
+            section_data = view_data.get(section_key, {})
+
+            if section_data:
+                st.markdown(f"### {display_name}")
+                st.dataframe(
+                    bracket_table(section_data),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+        champion = view_data.get("champion", "")
+
+        if champion:
+            st.success(f"🏆 Champion: {champion}")
 
     st.divider()
     st.header("Quick Champion Comparison")
@@ -510,6 +650,6 @@ with tab_compare:
         st.write(gokce_data.get("champion", "No champion saved yet."))
 
     with col2:
-        boyfriend_data = load_bracket("Jack")
+        jack_data = load_bracket("Jack")
         st.subheader("Jack")
-        st.write(boyfriend_data.get("champion", "No champion saved yet."))
+        st.write(jack_data.get("champion", "No champion saved yet."))
